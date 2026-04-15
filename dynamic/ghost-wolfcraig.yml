@@ -1,0 +1,23 @@
+# Ghost ActivityPub routing — proxies to Ghost Inc.'s hosted relay (ap.ghost.org)
+# when the local activitypub container is NOT running.
+# When activitypub profile IS active, container labels create higher-priority routers
+# that override these rules and route to the local container instead.
+#
+# Remove or disable this file if you never use ap.ghost.org.
+
+http:
+  routers:
+    ghost-activitypub-ext:
+      rule: "Host(`securitysaysyes.com`) && (PathPrefix(`/.ghost/activitypub/`) || Path(`/.well-known/webfinger`) || Path(`/.well-known/nodeinfo`))"
+      entryPoints:
+        - websecure
+      tls: {}
+      service: ap-ghost-org
+      priority: 5
+
+  services:
+    ap-ghost-org:
+      loadBalancer:
+        servers:
+          - url: "https://ap.ghost.org"
+        passHostHeader: false

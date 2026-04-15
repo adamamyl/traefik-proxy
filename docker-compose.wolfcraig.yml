@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/compose-spec/compose-spec/main/schema/compose-spec.json
+#
+# Wolfcraig production overlay.
+# Sets the global default TLS cert resolver so individual services only need tls=true.
+# Switch CERT_RESOLVER=leprod in .env once staging certs verified.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.wolfcraig.yml up -d
+
+services:
+  traefik:
+    command:
+      - --log.level=INFO
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=traefik-public
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      # Global default cert resolver — all tls=true routers use this automatically
+      - --entrypoints.websecure.http.tls.certresolver=${CERT_RESOLVER:-lestaging}
+      - --certificatesresolvers.lestaging.acme.tlschallenge=true
+      - --certificatesresolvers.lestaging.acme.email=${ACME_EMAIL:-hostmaster@adamamyl.com}
+      - --certificatesresolvers.lestaging.acme.storage=/letsencrypt/acme-staging.json
+      - --certificatesresolvers.lestaging.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
+      - --certificatesresolvers.leprod.acme.tlschallenge=true
+      - --certificatesresolvers.leprod.acme.email=${ACME_EMAIL:-hostmaster@adamamyl.com}
+      - --certificatesresolvers.leprod.acme.storage=/letsencrypt/acme-prod.json
+      - --api.dashboard=true
+      - --api.insecure=false

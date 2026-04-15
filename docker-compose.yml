@@ -1,0 +1,70 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/compose-spec/compose-spec/main/schema/compose-spec.json
+#
+# Traefik reverse proxy — shared edge for all stacks on this host.
+#
+# Pre-requisites (once per host):
+#   docker network create traefik-public
+#   touch /opt/traefik/acme-staging.json /opt/traefik/acme-prod.json
+#   chmod 600 /opt/traefik/acme-staging.json /opt/traefik/acme-prod.json
+#   (or run scripts/setup.sh)
+#
+# Usage:
+#   Local dev:   docker compose up -d
+#   Wolfcraig:   docker compose -f docker-compose.yml -f docker-compose.wolfcraig.yml up -d
+
+services:
+  traefik:
+    image: traefik:v3.3
+    restart: unless-stopped
+    mem_limit: 128m
+    mem_reservation: 32m
+    command:
+      - --log.level=INFO
+      # Docker provider — reads labels from running containers
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=traefik-public
+      # File provider — reads dynamic config from ./dynamic/
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      # Entrypoints
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      # Let's Encrypt — staging (safe for testing, use until ready for prod)
+      - --certificatesresolvers.lestaging.acme.tlschallenge=true
+      - --certificatesresolvers.lestaging.acme.email=${ACME_EMAIL:-hostmaster@adamamyl.com}
+      - --certificatesresolvers.lestaging.acme.storage=/letsencrypt/acme-staging.json
+      - --certificatesresolvers.lestaging.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
+      # Let's Encrypt — production (switch CERT_RESOLVER=leprod when staging verified)
+      - --certificatesresolvers.leprod.acme.tlschallenge=true
+      - --certificatesresolvers.leprod.acme.email=${ACME_EMAIL:-hostmaster@adamamyl.com}
+      - --certificatesresolvers.leprod.acme.storage=/letsencrypt/acme-prod.json
+      # Dashboard — routed via labels below, secured by tailscale-only@file middleware
+      - --api.dashboard=true
+      - --api.insecure=false
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_letsencrypt:/letsencrypt
+      - ./dynamic:/etc/traefik/dynamic:ro
+    networks:
+      - traefik-public
+    labels:
+      - traefik.enable=true
+      # Dashboard — restricted to Tailscale IPs via middleware in dynamic/middlewares.yml
+      - traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_DOMAIN:-traefik.localhost}`)
+      - traefik.http.routers.dashboard.entrypoints=websecure
+      - traefik.http.routers.dashboard.tls=true
+      - traefik.http.routers.dashboard.service=api@internal
+      - traefik.http.routers.dashboard.middlewares=tailscale-only@file
+
+volumes:
+  traefik_letsencrypt:
+
+networks:
+  traefik-public:
+    external: true
