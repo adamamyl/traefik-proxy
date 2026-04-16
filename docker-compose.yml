@@ -53,14 +53,8 @@ services:
       - ./dynamic:/etc/traefik/dynamic:ro
     networks:
       - traefik-public
-    labels:
-      - traefik.enable=true
-      # Dashboard — restricted to Tailscale IPs via middleware in dynamic/middlewares.yml
-      - traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_DOMAIN:-traefik.localhost}`)
-      - traefik.http.routers.dashboard.entrypoints=websecure
-      - traefik.http.routers.dashboard.tls=true
-      - traefik.http.routers.dashboard.service=api@internal
-      - traefik.http.routers.dashboard.middlewares=tailscale-only@file
+    # Dashboard labels defined in deployment overlay (e.g. docker-compose.wolfcraig.yml)
+    # to avoid duplicate router configs when overlays add tls.certresolver
 
 volumes:
   traefik_letsencrypt:
