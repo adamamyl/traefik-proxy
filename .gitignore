@@ -1,0 +1,3 @@
+.env
+# ACME cert storage — contains private keys
+*.json

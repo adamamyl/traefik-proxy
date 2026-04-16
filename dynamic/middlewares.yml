@@ -1,0 +1,20 @@
+http:
+  middlewares:
+    # Restrict access to Tailscale IP range only (use for dashboard, admin routes)
+    tailscale-only:
+      ipAllowList:
+        sourceRange:
+          - "100.64.0.0/10"
+
+    # Common security headers — import with middlewares: security-headers@file
+    security-headers:
+      headers:
+        stsSeconds: 63072000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        contentTypeNosniff: true
+        frameDeny: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+        customResponseHeaders:
+          Permissions-Policy: "geolocation=(self), camera=(), microphone=()"
+          Server: ""
