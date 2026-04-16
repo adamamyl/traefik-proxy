@@ -14,7 +14,7 @@
 
 services:
   traefik:
-    image: traefik:v3.3
+    image: traefik:v3.6
     restart: unless-stopped
     mem_limit: 128m
     mem_reservation: 32m

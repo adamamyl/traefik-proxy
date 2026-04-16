@@ -31,3 +31,11 @@ services:
       - --certificatesresolvers.leprod.acme.storage=/letsencrypt/acme-prod.json
       - --api.dashboard=true
       - --api.insecure=false
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_DOMAIN:-traefik.localhost}`)
+      - traefik.http.routers.dashboard.entrypoints=websecure
+      - traefik.http.routers.dashboard.tls=true
+      - traefik.http.routers.dashboard.tls.certresolver=${CERT_RESOLVER:-lestaging}
+      - traefik.http.routers.dashboard.service=api@internal
+      - traefik.http.routers.dashboard.middlewares=tailscale-only@file
