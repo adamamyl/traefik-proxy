@@ -39,11 +39,14 @@ mkcert -install
 
 mkdir -p "${CERTS_DIR}"
 
-info "Generating cert for localhost / *.localhost / *.internal..."
+EXTRA_DOMAINS=("$@")
+
+info "Generating cert for localhost / *.localhost / *.internal${EXTRA_DOMAINS[*]:+ / ${EXTRA_DOMAINS[*]}}..."
 mkcert \
   -cert-file "${CERTS_DIR}/local.crt" \
   -key-file "${CERTS_DIR}/local.key" \
-  localhost 127.0.0.1 "*.localhost" "*.internal"
+  localhost 127.0.0.1 "*.localhost" "*.internal" \
+  "${EXTRA_DOMAINS[@]+"${EXTRA_DOMAINS[@]}"}"
 
 info "Writing ${DYNAMIC_TLS}..."
 cat >"${DYNAMIC_TLS}" <<'EOF'
@@ -51,6 +54,11 @@ tls:
   certificates:
     - certFile: /certs/local.crt
       keyFile: /certs/local.key
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/local.crt
+        keyFile: /certs/local.key
 EOF
 
 ok "Done. Start Traefik: docker compose up -d"
