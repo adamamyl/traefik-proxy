@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail; IFS=$'\n\t'
+
+# setup-local-tls — install mkcert CA and generate certs for local Traefik dev
+# Idempotent: safe to re-run after container restarts or domain changes.
+
+if [[ -t 1 ]]; then
+  _reset='\033[0m'; _blue='\033[34m'; _green='\033[32m'; _red='\033[31m'
+else
+  _reset=''; _blue=''; _green=''; _red=''
+fi
+
+info()  { echo -e "${_blue}ℹ  $*${_reset}"; }
+ok()    { echo -e "${_green}✓ $*${_reset}"; }
+error() { echo -e "${_red}✗ $*${_reset}" >&2; }
+
+require() { command -v "$1" >/dev/null 2>&1 || { error "Required: $1 — install with: brew install $1"; exit 1; }; }
+
+# ── platform ─────────────────────────────────────────────────────────────────
+
+if [[ "$(uname)" != "Darwin" ]]; then
+  error "macOS only — use ACME resolvers in production"
+  exit 1
+fi
+
+require mkcert
+
+# ── paths ─────────────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CERTS_DIR="${REPO_ROOT}/certs"
+DYNAMIC_TLS="${REPO_ROOT}/dynamic/tls-local.yml"
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+info "Installing mkcert CA (idempotent)..."
+mkcert -install
+
+mkdir -p "${CERTS_DIR}"
+
+info "Generating cert for localhost / *.localhost / *.internal..."
+mkcert \
+  -cert-file "${CERTS_DIR}/local.crt" \
+  -key-file "${CERTS_DIR}/local.key" \
+  localhost 127.0.0.1 "*.localhost" "*.internal"
+
+info "Writing ${DYNAMIC_TLS}..."
+cat >"${DYNAMIC_TLS}" <<'EOF'
+tls:
+  certificates:
+    - certFile: /certs/local.crt
+      keyFile: /certs/local.key
+EOF
+
+ok "Done. Start Traefik: docker compose up -d"

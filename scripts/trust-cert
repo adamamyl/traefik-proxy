@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail; IFS=$'\n\t'
+
+# trust-cert — extract Traefik's self-signed cert from localhost:443 and trust it in macOS keychain
+
+if [[ -t 1 ]]; then
+  _reset='\033[0m'; _blue='\033[34m'; _green='\033[32m'; _red='\033[31m'
+else
+  _reset=''; _blue=''; _green=''; _red=''
+fi
+
+info()  { echo -e "${_blue}ℹ  $*${_reset}"; }
+ok()    { echo -e "${_green}✓ $*${_reset}"; }
+error() { echo -e "${_red}✗ $*${_reset}" >&2; }
+
+require() { command -v "$1" >/dev/null 2>&1 || { error "Required: $1"; exit 1; }; }
+
+# ── platform ─────────────────────────────────────────────────────────────────
+
+if [[ "$(uname)" != "Darwin" ]]; then
+  error "macOS only"
+  exit 1
+fi
+
+require openssl
+require security
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+KEYCHAIN="/Library/Keychains/System.keychain"
+CERT_TMP="$(mktemp /tmp/traefik-cert.XXXXXX.crt)"
+trap 'rm -f "${CERT_TMP}"' EXIT
+
+info "Extracting cert from localhost:443..."
+if ! openssl s_client -connect localhost:443 </dev/null 2>/dev/null \
+  | openssl x509 >"${CERT_TMP}" 2>/dev/null; then
+  error "Failed — is Traefik running on localhost:443?"
+  exit 1
+fi
+
+CERT_CN="$(openssl x509 -noout -subject -in "${CERT_TMP}" | sed 's/.*CN *= *//')"
+info "CN: ${CERT_CN}"
+
+if security find-certificate -c "${CERT_CN}" "${KEYCHAIN}" >/dev/null 2>&1; then
+  info "Removing existing cert: ${CERT_CN}"
+  sudo security delete-certificate -c "${CERT_CN}" "${KEYCHAIN}"
+fi
+
+info "Trusting cert in ${KEYCHAIN}..."
+sudo security add-trusted-cert -d -r trustRoot -k "${KEYCHAIN}" "${CERT_TMP}"
+
+ok "Done. Restart browser to apply."
