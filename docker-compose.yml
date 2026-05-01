@@ -51,6 +51,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - traefik_letsencrypt:/letsencrypt
       - ./dynamic:/etc/traefik/dynamic:ro
+      - ./certs:/certs:ro
     networks:
       - traefik-public
     # Dashboard labels defined in deployment overlay (e.g. docker-compose.wolfcraig.yml)

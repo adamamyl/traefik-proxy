@@ -24,8 +24,27 @@ docker compose -f docker-compose.yml -f docker-compose.wolfcraig.yml up -d
 docker compose up -d
 ```
 
-Local dev uses Traefik's built-in self-signed certs (browser warns — expected).
+Local dev uses mkcert-issued certs — browser-trusted, stable across container restarts.
 Add `.internal` hostnames to `/etc/hosts` pointing to `127.0.0.1`.
+
+### Local TLS setup (macOS, once per machine)
+
+```bash
+brew install mkcert
+bash scripts/setup-local-tls
+docker compose up -d
+```
+
+Generates `certs/local.crt` + `certs/local.key` (gitignored), writes `dynamic/tls-local.yml`,
+and installs the mkcert CA into your macOS system keychain. Re-running is safe (idempotent).
+
+### Quick workaround (trust Traefik's built-in self-signed cert)
+
+If you can't use mkcert, trust the self-signed cert directly — but re-run after every container restart:
+
+```bash
+bash scripts/trust-cert
+```
 
 ## Cert resolver progression
 
