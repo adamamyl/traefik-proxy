@@ -1,55 +1,164 @@
 #!/usr/bin/env bash
 set -euo pipefail; IFS=$'\n\t'
 
-# setup-local-tls — install mkcert CA and generate certs for local Traefik dev
-# Idempotent: safe to re-run after container restarts or domain changes.
+# setup-local-tls — mkcert CA install + 47-day cert generate/renew for local Traefik dev
+#
+# Self-supporting: installs mkcert via Homebrew if absent.
+# Idempotent: skips generation when cert is valid and SANs match current Docker networks.
+# Auto-renew: regenerates when < RENEW_THRESHOLD_DAYS remain or SANs drift.
+#
+# Usage: setup-local-tls [extra-domain ...]
+
+CERT_VALIDITY_DAYS=47
+RENEW_THRESHOLD_DAYS=7
+
+# ── logging ───────────────────────────────────────────────────────────────────
 
 if [[ -t 1 ]]; then
-  _reset='\033[0m'; _blue='\033[34m'; _green='\033[32m'; _red='\033[31m'
+  _reset='\033[0m'; _blue='\033[34m'; _green='\033[32m'
+  _red='\033[31m'; _yellow='\033[33m'
 else
-  _reset=''; _blue=''; _green=''; _red=''
+  _reset=''; _blue=''; _green=''; _red=''; _yellow=''
 fi
 
 info()  { echo -e "${_blue}ℹ  $*${_reset}"; }
 ok()    { echo -e "${_green}✓ $*${_reset}"; }
+warn()  { echo -e "${_yellow}⚠  $*${_reset}"; }
 error() { echo -e "${_red}✗ $*${_reset}" >&2; }
 
-require() { command -v "$1" >/dev/null 2>&1 || { error "Required: $1 — install with: brew install $1"; exit 1; }; }
-
-# ── platform ─────────────────────────────────────────────────────────────────
+# ── platform ──────────────────────────────────────────────────────────────────
 
 if [[ "$(uname)" != "Darwin" ]]; then
   error "macOS only — use ACME resolvers in production"
   exit 1
 fi
 
+# ── dependencies ──────────────────────────────────────────────────────────────
+
+require() {
+  local cmd="$1"
+  command -v "${cmd}" >/dev/null 2>&1 && return 0
+  if command -v brew >/dev/null 2>&1; then
+    info "Installing ${cmd} via Homebrew..."
+    brew install "${cmd}"
+  else
+    error "Required: ${cmd}. Install Homebrew first: https://brew.sh"
+    exit 1
+  fi
+}
+
 require mkcert
+# openssl ships with macOS; no brew install needed
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CERTS_DIR="${REPO_ROOT}/certs"
+CERT_FILE="${CERTS_DIR}/local.crt"
+KEY_FILE="${CERTS_DIR}/local.key"
 DYNAMIC_TLS="${REPO_ROOT}/dynamic/tls-local.yml"
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-info "Installing mkcert CA (idempotent)..."
-mkcert -install
+# Print one domain per line: base set + live Docker network wildcards + extras
+collect_domains() {
+  printf '%s\n' localhost "127.0.0.1" "*.localhost" "*.internal"
 
-mkdir -p "${CERTS_DIR}"
+  if command -v docker >/dev/null 2>&1; then
+    while IFS= read -r net; do
+      [[ -z "${net}" ]] && continue
+      [[ "${net}" =~ ^(bridge|host|none)$ ]] && continue
+      printf '*.%s.internal\n' "${net}"
+    done < <(docker network ls --format '{{.Name}}' 2>/dev/null || true)
+  fi
 
-EXTRA_DOMAINS=("$@")
+  for d in "$@"; do printf '%s\n' "${d}"; done
+}
 
-info "Generating cert for localhost / *.localhost / *.internal${EXTRA_DOMAINS[*]:+ / ${EXTRA_DOMAINS[*]}}..."
-mkcert \
-  -cert-file "${CERTS_DIR}/local.crt" \
-  -key-file "${CERTS_DIR}/local.key" \
-  localhost 127.0.0.1 "*.localhost" "*.internal" \
-  "${EXTRA_DOMAINS[@]+"${EXTRA_DOMAINS[@]}"}"
+# Print sorted DNS SANs from cert, one per line
+cert_dns_sans() {
+  openssl x509 -in "$1" -noout -text 2>/dev/null \
+    | grep -A1 "Subject Alternative Name" \
+    | tail -1 \
+    | tr -d ' ' | tr ',' '\n' \
+    | grep '^DNS:' | sed 's/^DNS://' \
+    | LC_ALL=C sort
+}
 
-info "Writing ${DYNAMIC_TLS}..."
-cat >"${DYNAMIC_TLS}" <<'EOF'
+# Returns 0 (true) if cert is missing or expires within threshold
+cert_needs_renewal() {
+  local cert="$1" threshold_secs="$2"
+  [[ ! -f "${cert}" ]] && return 0
+  ! openssl x509 -in "${cert}" -noout -checkend "${threshold_secs}" 2>/dev/null
+}
+
+# Returns 0 (true) if DNS SANs in cert differ from expected domain list
+cert_sans_changed() {
+  local cert="$1"
+  shift
+  [[ ! -f "${cert}" ]] && return 0
+
+  local current expected
+  current="$(cert_dns_sans "${cert}")"
+  # Compare DNS names only (filter IPs)
+  expected="$(printf '%s\n' "$@" | grep -v '^[0-9]' | LC_ALL=C sort)"
+  [[ "${current}" != "${expected}" ]]
+}
+
+# Sign a cert with the mkcert CA for CERT_VALIDITY_DAYS
+generate_cert() {
+  local ca_root
+  ca_root="$(mkcert -CAROOT)"
+  local ca_cert="${ca_root}/rootCA.pem"
+  local ca_key="${ca_root}/rootCA-key.pem"
+
+  if [[ ! -f "${ca_cert}" || ! -f "${ca_key}" ]]; then
+    error "mkcert CA missing at ${ca_root} — run: mkcert -install"
+    exit 1
+  fi
+
+  # Build SAN string (IP: for addresses, DNS: for names)
+  local san_parts=()
+  for domain in "$@"; do
+    if [[ "${domain}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      san_parts+=("IP:${domain}")
+    else
+      san_parts+=("DNS:${domain}")
+    fi
+  done
+  local san_string
+  san_string="$(printf '%s,' "${san_parts[@]}")"
+  san_string="${san_string%,}"
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "${tmpdir}"; trap - RETURN' RETURN
+
+  mkdir -p "${CERTS_DIR}"
+
+  openssl genrsa -out "${KEY_FILE}" 2048 2>/dev/null
+  openssl req -new \
+    -key "${KEY_FILE}" \
+    -out "${tmpdir}/cert.csr" \
+    -subj "/O=mkcert development certificate" \
+    2>/dev/null
+  openssl x509 -req \
+    -in "${tmpdir}/cert.csr" \
+    -CA "${ca_cert}" \
+    -CAkey "${ca_key}" \
+    -CAcreateserial \
+    -out "${CERT_FILE}" \
+    -days "${CERT_VALIDITY_DAYS}" \
+    -sha256 \
+    -extfile <(printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' \
+      "${san_string}") \
+    2>/dev/null
+}
+
+write_traefik_config() {
+  info "Writing ${DYNAMIC_TLS}..."
+  cat >"${DYNAMIC_TLS}" <<'EOF'
 tls:
   certificates:
     - certFile: /certs/local.crt
@@ -60,5 +169,50 @@ tls:
         certFile: /certs/local.crt
         keyFile: /certs/local.key
 EOF
+}
 
-ok "Done. Start Traefik: docker compose up -d"
+# ── main ─────────────────────────────────────────────────────────────────────
+
+main() {
+  info "Installing mkcert CA (idempotent)..."
+  mkcert -install
+
+  local domains=()
+  while IFS= read -r d; do
+    domains+=("${d}")
+  done < <(collect_domains "$@")
+
+  local threshold_secs=$(( RENEW_THRESHOLD_DAYS * 86400 ))
+  local reason=""
+
+  if [[ ! -f "${CERT_FILE}" ]]; then
+    reason="no cert"
+  elif cert_needs_renewal "${CERT_FILE}" "${threshold_secs}"; then
+    reason="expires within ${RENEW_THRESHOLD_DAYS}d"
+  elif cert_sans_changed "${CERT_FILE}" "${domains[@]}"; then
+    reason="SANs changed (Docker network drift)"
+  fi
+
+  if [[ -n "${reason}" ]]; then
+    info "Generating cert (${reason}) — ${#domains[@]} domains..."
+    generate_cert "${domains[@]}"
+    write_traefik_config
+
+    local expiry
+    expiry="$(openssl x509 -in "${CERT_FILE}" -noout -enddate | cut -d= -f2)"
+    ok "Cert generated. Expires: ${expiry}"
+    ok "SANs: $(cert_dns_sans "${CERT_FILE}" | tr '\n' ' ')"
+    info "Traefik picks up cert via file-watch — no restart needed"
+  else
+    local expiry
+    expiry="$(openssl x509 -in "${CERT_FILE}" -noout -enddate | cut -d= -f2)"
+    ok "Cert valid, SANs current. Expires: ${expiry}"
+  fi
+
+  # Ensure Traefik config exists even when cert wasn't regenerated
+  [[ -f "${DYNAMIC_TLS}" ]] || write_traefik_config
+
+  ok "Done."
+}
+
+main "$@"
