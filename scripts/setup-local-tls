@@ -156,6 +156,61 @@ generate_cert() {
     2>/dev/null
 }
 
+# ── launchd agent ─────────────────────────────────────────────────────────────
+
+install_agent() {
+  local label="com.adamamyl.traefik-local-tls"
+  local dst="${HOME}/Library/LaunchAgents/${label}.plist"
+  local uid
+  uid="$(id -u)"
+
+  info "Writing launchd plist → ${dst}..."
+  cat >"${dst}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${label}</string>
+
+    <key>WorkingDirectory</key>
+    <string>${REPO_ROOT}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>${REPO_ROOT}/scripts/setup-local-tls</string>
+    </array>
+
+    <key>Nice</key>
+    <integer>1</integer>
+
+    <!-- daily — 7-day renewal threshold means daily checks are sufficient -->
+    <key>StartInterval</key>
+    <integer>86400</integer>
+
+    <!-- RunAtLoad false: Docker may not be up yet at login -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/${label}.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/${label}.err</string>
+  </dict>
+</plist>
+EOF
+  chmod 644 "${dst}"
+
+  if launchctl list "${label}" >/dev/null 2>&1; then
+    ok "Agent already loaded: ${label}"
+  else
+    info "Bootstrapping launchd agent..."
+    launchctl bootstrap "gui/${uid}" "${dst}"
+    ok "Agent installed: ${label} (daily)"
+  fi
+}
+
 write_traefik_config() {
   info "Writing ${DYNAMIC_TLS}..."
   cat >"${DYNAMIC_TLS}" <<'EOF'
@@ -211,6 +266,8 @@ main() {
 
   # Ensure Traefik config exists even when cert wasn't regenerated
   [[ -f "${DYNAMIC_TLS}" ]] || write_traefik_config
+
+  install_agent
 
   ok "Done."
 }
