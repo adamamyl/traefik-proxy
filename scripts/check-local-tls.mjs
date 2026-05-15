@@ -24,7 +24,9 @@ const bold   = s => `\x1b[1m${s}\x1b[0m`;
 function tlsCheck(hostname, port = 443) {
   return new Promise(res => {
     let ca;
-    try { ca = readFileSync(ROOT_CA); } catch { /* no local CA yet */ }
+    try { ca = readFileSync(ROOT_CA); } catch {
+      console.warn(yellow(`  warn: ${ROOT_CA} not found — skipping cert verification`));
+    }
     const socket = connect({ host: hostname, port, servername: hostname, ca, rejectUnauthorized: !!ca }, () => {
       const cert = socket.getPeerCertificate(true);
       socket.destroy();

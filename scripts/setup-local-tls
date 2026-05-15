@@ -199,13 +199,15 @@ trust_ca_root() {
       return 0
     fi
     info "Removing stale CA from keychain..."
-    sudo security delete-certificate -c "${cn}" /Library/Keychains/System.keychain
+    sudo security delete-certificate -c "${cn}" /Library/Keychains/System.keychain \
+      || { error "Failed to remove stale CA — run: sudo security delete-certificate -c '${cn}' /Library/Keychains/System.keychain"; exit 1; }
   fi
 
   info "Trusting root CA in System keychain (sudo required)..."
   sudo security add-trusted-cert -d -r trustRoot \
     -k /Library/Keychains/System.keychain \
-    "${STEP_CA_ROOT}"
+    "${STEP_CA_ROOT}" \
+    || { error "Failed to trust CA — run manually: sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${STEP_CA_ROOT}"; exit 1; }
   ok "CA trusted: ${cn} — restart browser to apply"
 }
 
@@ -261,13 +263,13 @@ generate_cert() {
       "${san_string}") \
     2>/dev/null
 
-    cat "${tmpdir}/leaf.crt" "${STEP_CA_ROOT}" > "${CERT_FILE}"
+  cat "${tmpdir}/leaf.crt" "${STEP_CA_ROOT}" > "${CERT_FILE}"
 }
 
 # ── traefik config ─────────────────────────────────────────────────────────────
 write_traefik_config() {
   info "Writing ${DYNAMIC_TLS}..."
-  # Traefik runs in Docker with ./certs mounted at /certs — use container path
+  # /certs matches the volume mount in docker-compose.yml: ./certs:/certs:ro
   local container_cert="/certs/$(basename "${CERT_FILE}")"
   local container_key="/certs/$(basename "${KEY_FILE}")"
   cat >"${DYNAMIC_TLS}" <<EOF
