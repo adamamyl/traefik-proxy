@@ -9,8 +9,8 @@
 #   (or run scripts/setup.sh)
 #
 # Usage:
-#   Local dev:   docker compose up -d
-#   Wolfcraig:   docker compose -f docker-compose.yml -f docker-compose.wolfcraig.yml up -d
+#   Laptop/local: docker compose -f docker-compose.yml -f docker-compose.localhost.yml up -d
+#   Wolfcraig:    docker compose -f docker-compose.yml -f docker-compose.wolfcraig.yml up -d
 
 services:
   traefik:

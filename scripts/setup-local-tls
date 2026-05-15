@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail; IFS=$'\n\t'
 
-# setup-local-tls — mkcert CA install + 47-day cert generate/renew for local Traefik dev
+# setup-local-tls — step-ca local CA + cert generate/renew for local Traefik dev
 #
-# Self-supporting: installs mkcert via Homebrew if absent.
-# Idempotent: skips generation when cert is valid and SANs match current Docker networks.
-# Auto-renew: regenerates when < RENEW_THRESHOLD_DAYS remain or SANs drift.
+# Discovers hostnames from running Docker container Traefik labels and issues a
+# cert with explicit SANs (macOS does not honour *.localhost wildcards).
+# Trusts the step-ca root CA in the macOS System keychain on first run.
+#
+# Auto-renew: daily launchd agent + watch-traefik-hosts event watcher (both
+# installed by this script).
 #
 # Usage: setup-local-tls [extra-domain ...]
 
-CERT_VALIDITY_DAYS=47
-RENEW_THRESHOLD_DAYS=7
+CERT_VALIDITY_DAYS=21        # 21 days per cert
+RENEW_THRESHOLD_DAYS=2      # regenerate when < 2 days remain
+STEP_CA_URL="https://127.0.0.1:9000"
 
 # ── logging ───────────────────────────────────────────────────────────────────
 
@@ -47,8 +51,8 @@ require() {
   fi
 }
 
-require mkcert
-# openssl ships with macOS; no brew install needed
+require step
+require docker
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 
@@ -57,20 +61,47 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CERTS_DIR="${REPO_ROOT}/certs"
 CERT_FILE="${CERTS_DIR}/local.crt"
 KEY_FILE="${CERTS_DIR}/local.key"
+STEP_CA_ROOT="${CERTS_DIR}/step-ca-root.crt"
 DYNAMIC_TLS="${REPO_ROOT}/dynamic/tls-local.yml"
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+COMPOSE_CMD=(docker compose
+  -f "${REPO_ROOT}/docker-compose.yml"
+  -f "${REPO_ROOT}/docker-compose.localhost.yml"
+)
 
-# Print one domain per line: base set + live Docker network wildcards + extras
-collect_domains() {
-  printf '%s\n' localhost "127.0.0.1" "*.localhost" "*.internal"
+# ── shell function isolation ───────────────────────────────────────────────────
 
-  if command -v docker >/dev/null 2>&1; then
-    while IFS= read -r net; do
-      [[ -z "${net}" ]] && continue
-      [[ "${net}" =~ ^(bridge|host|none)$ ]] && continue
-      printf '*.%s.internal\n' "${net}"
-    done < <(docker network ls --format '{{.Name}}' 2>/dev/null || true)
+# The user's shell may define docker() to intercept 'docker ps'.
+# Discover where it was defined, unset it so script uses the real binary,
+# and restore it at the end.
+_DOCKERPS_SRC=""
+if declare -f docker >/dev/null 2>&1; then
+  shopt -s extdebug
+  read -r _ _ _DOCKERPS_SRC < <(declare -F docker 2>/dev/null)
+  shopt -u extdebug
+  unset -f docker
+fi
+
+# ── hostname discovery ────────────────────────────────────────────────────────
+
+# Print one hostname/IP per line: base set + hostnames from Docker Traefik labels + extras
+discover_hostnames() {
+  printf '%s\n' localhost "127.0.0.1"
+
+  if docker info >/dev/null 2>&1; then
+    local ids
+    ids="$(docker ps -q 2>/dev/null)" || true
+    if [[ -n "${ids}" ]]; then
+      # shellcheck disable=SC2016
+      echo "${ids}" \
+        | xargs docker inspect \
+            --format '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' \
+            2>/dev/null \
+        | grep -E '^traefik\.(http|tcp)\.routers\.[^.]+\.rule=' \
+        | grep -oE '[a-zA-Z0-9._-]+\.(localhost|internal)' \
+        | sort -u \
+        || true
+    fi
   fi
 
   for d in "$@"; do printf '%s\n' "${d}"; done
@@ -86,41 +117,121 @@ cert_dns_sans() {
     | LC_ALL=C sort
 }
 
-# Returns 0 (true) if cert is missing or expires within threshold
+# Returns 0 if cert is missing or expires within threshold
 cert_needs_renewal() {
   local cert="$1" threshold_secs="$2"
   [[ ! -f "${cert}" ]] && return 0
-  ! openssl x509 -in "${cert}" -noout -checkend "${threshold_secs}" 2>/dev/null
+  ! openssl x509 -in "${cert}" -noout -checkend "${threshold_secs}" >/dev/null 2>&1
 }
 
-# Returns 0 (true) if DNS SANs in cert differ from expected domain list
+# Returns 0 if DNS SANs in cert differ from expected domain list
 cert_sans_changed() {
-  local cert="$1"
-  shift
+  local cert="$1"; shift
   [[ ! -f "${cert}" ]] && return 0
-
   local current expected
   current="$(cert_dns_sans "${cert}")"
-  # Compare DNS names only (filter IPs)
   expected="$(printf '%s\n' "$@" | grep -v '^[0-9]' | LC_ALL=C sort)"
   [[ "${current}" != "${expected}" ]]
 }
 
-# Sign a cert with the mkcert CA for CERT_VALIDITY_DAYS
-generate_cert() {
-  local ca_root
-  ca_root="$(mkcert -CAROOT)"
-  local ca_cert="${ca_root}/rootCA.pem"
-  local ca_key="${ca_root}/rootCA-key.pem"
+# ── step-ca lifecycle ─────────────────────────────────────────────────────────
 
-  if [[ ! -f "${ca_cert}" || ! -f "${ca_key}" ]]; then
-    error "mkcert CA missing at ${ca_root} — run: mkcert -install"
+# Wait for step-ca HTTP health endpoint (no root cert needed)
+wait_for_step_ca() {
+  local attempts=0
+  until curl -sk "${STEP_CA_URL}/health" >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    (( attempts > 60 )) && { error "step-ca did not become ready after 60s"; exit 1; }
+    sleep 1
+  done
+}
+
+# Ensure step-ca container is running; start it if not
+ensure_step_ca() {
+  if curl -sk "${STEP_CA_URL}/health" >/dev/null 2>&1; then
+    return 0
+  fi
+  info "Starting step-ca..."
+  "${COMPOSE_CMD[@]}" up -d step-ca
+  # First start runs 'step ca init' before serving — may take 10–20s
+  wait_for_step_ca
+  ok "step-ca ready"
+}
+
+# On first run (or CA rotation): extract root cert from container
+init_step_ca() {
+  mkdir -p "${CERTS_DIR}"
+
+  local container_fp
+  container_fp="$("${COMPOSE_CMD[@]}" exec -T step-ca \
+    step certificate fingerprint /home/step/certs/root_ca.crt 2>/dev/null)"
+
+  if [[ -f "${STEP_CA_ROOT}" ]]; then
+    local host_fp
+    host_fp="$(step certificate fingerprint "${STEP_CA_ROOT}" 2>/dev/null)"
+    if [[ "${container_fp}" == "${host_fp}" ]]; then
+      return 0  # already initialised
+    fi
+    warn "step-ca root CA rotated — re-initialising..."
+  fi
+
+  info "Extracting step-ca root CA (fingerprint: ${container_fp:0:16}...)..."
+  "${COMPOSE_CMD[@]}" exec -T step-ca \
+    cat /home/step/certs/root_ca.crt > "${STEP_CA_ROOT}"
+  ok "step-ca initialised"
+}
+
+# ── macOS trust ───────────────────────────────────────────────────────────────
+
+# Trust the step-ca root CA in the macOS System keychain (idempotent)
+trust_ca_root() {
+  local cn
+  cn="$(openssl x509 -noout -subject -in "${STEP_CA_ROOT}" \
+    | sed 's/.*CN *= *//' | sed 's/ *$//')"
+
+  if security find-certificate -c "${cn}" /Library/Keychains/System.keychain >/dev/null 2>&1; then
+    local stored_fp new_fp
+    stored_fp="$(security find-certificate -c "${cn}" -p /Library/Keychains/System.keychain 2>/dev/null \
+      | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)"
+    new_fp="$(openssl x509 -noout -fingerprint -sha256 -in "${STEP_CA_ROOT}" | cut -d= -f2)"
+    if [[ "${stored_fp}" == "${new_fp}" ]]; then
+      ok "CA already trusted: ${cn}"
+      return 0
+    fi
+    info "Removing stale CA from keychain..."
+    sudo security delete-certificate -c "${cn}" /Library/Keychains/System.keychain
+  fi
+
+  info "Trusting root CA in System keychain (sudo required)..."
+  sudo security add-trusted-cert -d -r trustRoot \
+    -k /Library/Keychains/System.keychain \
+    "${STEP_CA_ROOT}"
+  ok "CA trusted: ${cn} — restart browser to apply"
+}
+
+# ── cert issuance ─────────────────────────────────────────────────────────────
+
+generate_cert() {
+  local domains=("$@")
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "${tmpdir}"; trap - RETURN' RETURN
+
+  mkdir -p "${CERTS_DIR}"
+
+  # Decrypt root CA key from container into a temp file (never persisted on host)
+  if ! "${COMPOSE_CMD[@]}" exec -T step-ca \
+      step crypto key format \
+        --pem --no-password --insecure \
+        --password-file /home/step/secrets/password \
+        /home/step/secrets/root_ca_key \
+      >"${tmpdir}/root_ca.key" 2>/dev/null; then
+    error "Failed to export CA key from step-ca container"
     exit 1
   fi
 
-  # Build SAN string (IP: for addresses, DNS: for names)
   local san_parts=()
-  for domain in "$@"; do
+  for domain in "${domains[@]}"; do
     if [[ "${domain}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       san_parts+=("IP:${domain}")
     else
@@ -131,12 +242,6 @@ generate_cert() {
   san_string="$(printf '%s,' "${san_parts[@]}")"
   san_string="${san_string%,}"
 
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "${tmpdir}"; trap - RETURN' RETURN
-
-  mkdir -p "${CERTS_DIR}"
-
   openssl genrsa -out "${KEY_FILE}" 2048 2>/dev/null
   openssl req -new \
     -key "${KEY_FILE}" \
@@ -145,97 +250,132 @@ generate_cert() {
     2>/dev/null
   openssl x509 -req \
     -in "${tmpdir}/cert.csr" \
-    -CA "${ca_cert}" \
-    -CAkey "${ca_key}" \
+    -CA "${STEP_CA_ROOT}" \
+    -CAkey "${tmpdir}/root_ca.key" \
     -CAcreateserial \
-    -out "${CERT_FILE}" \
+    -out "${tmpdir}/leaf.crt" \
     -days "${CERT_VALIDITY_DAYS}" \
     -sha256 \
-    -extfile <(printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' \
+    -extfile <(printf \
+      'subjectAltName=%s\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' \
       "${san_string}") \
     2>/dev/null
+
+    cat "${tmpdir}/leaf.crt" "${STEP_CA_ROOT}" > "${CERT_FILE}"
 }
 
-# ── launchd agent ─────────────────────────────────────────────────────────────
+# ── traefik config ─────────────────────────────────────────────────────────────
+write_traefik_config() {
+  info "Writing ${DYNAMIC_TLS}..."
+  # Traefik runs in Docker with ./certs mounted at /certs — use container path
+  local container_cert="/certs/$(basename "${CERT_FILE}")"
+  local container_key="/certs/$(basename "${KEY_FILE}")"
+  cat >"${DYNAMIC_TLS}" <<EOF
+tls:
+  certificates:
+    - certFile: ${container_cert}
+      keyFile: ${container_key}
+  stores:
+    default:
+      defaultCertificate:
+        certFile: ${container_cert}
+        keyFile: ${container_key}
+EOF
+}
 
-install_agent() {
+# ── launchd agents ────────────────────────────────────────────────────────────
+
+install_agents() {
+  local uid; uid="$(id -u)"
+  _install_renewal_agent "${uid}"
+  _install_watcher_agent "${uid}"
+}
+
+_install_renewal_agent() {
+  local uid="$1"
   local label="com.adamamyl.traefik-local-tls"
   local dst="${HOME}/Library/LaunchAgents/${label}.plist"
-  local uid
-  uid="$(id -u)"
 
-  info "Writing launchd plist → ${dst}..."
   cat >"${dst}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
-    <key>Label</key>
-    <string>${label}</string>
-
-    <key>WorkingDirectory</key>
-    <string>${REPO_ROOT}</string>
-
+    <key>Label</key><string>${label}</string>
+    <key>WorkingDirectory</key><string>${REPO_ROOT}</string>
     <key>ProgramArguments</key>
     <array>
       <string>${REPO_ROOT}/scripts/setup-local-tls</string>
     </array>
-
-    <key>Nice</key>
-    <integer>1</integer>
-
-    <!-- daily — 7-day renewal threshold means daily checks are sufficient -->
-    <key>StartInterval</key>
-    <integer>86400</integer>
-
-    <!-- RunAtLoad false: Docker may not be up yet at login -->
-    <key>RunAtLoad</key>
-    <false/>
-
-    <key>StandardOutPath</key>
-    <string>/tmp/${label}.out</string>
-
-    <key>StandardErrorPath</key>
-    <string>/tmp/${label}.err</string>
+    <key>Nice</key><integer>1</integer>
+    <key>StartInterval</key><integer>86400</integer>
+    <key>RunAtLoad</key><false/>
+    <key>StandardOutPath</key><string>/tmp/${label}.out</string>
+    <key>StandardErrorPath</key><string>/tmp/${label}.err</string>
   </dict>
 </plist>
 EOF
   chmod 644 "${dst}"
 
   if launchctl list "${label}" >/dev/null 2>&1; then
-    ok "Agent already loaded: ${label}"
+    ok "Renewal agent already loaded: ${label}"
   else
-    info "Bootstrapping launchd agent..."
     launchctl bootstrap "gui/${uid}" "${dst}"
-    ok "Agent installed: ${label} (daily)"
+    ok "Renewal agent installed: ${label} (daily)"
   fi
 }
 
-write_traefik_config() {
-  info "Writing ${DYNAMIC_TLS}..."
-  cat >"${DYNAMIC_TLS}" <<'EOF'
-tls:
-  certificates:
-    - certFile: /certs/local.crt
-      keyFile: /certs/local.key
-  stores:
-    default:
-      defaultCertificate:
-        certFile: /certs/local.crt
-        keyFile: /certs/local.key
+_install_watcher_agent() {
+  local uid="$1"
+  local label="com.adamamyl.traefik-host-watcher"
+  local dst="${HOME}/Library/LaunchAgents/${label}.plist"
+
+  cat >"${dst}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key><string>${label}</string>
+    <key>WorkingDirectory</key><string>${REPO_ROOT}</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>${REPO_ROOT}/scripts/watch-traefik-hosts</string>
+    </array>
+    <key>KeepAlive</key><true/>
+    <key>RunAtLoad</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>/tmp/${label}.out</string>
+    <key>StandardErrorPath</key><string>/tmp/${label}.err</string>
+  </dict>
+</plist>
 EOF
+  chmod 644 "${dst}"
+
+  if launchctl list "${label}" >/dev/null 2>&1; then
+    launchctl kickstart -k "gui/${uid}/${label}" >/dev/null 2>&1 || true
+    ok "Host-watcher agent reloaded: ${label}"
+  else
+    launchctl bootstrap "gui/${uid}" "${dst}"
+    ok "Host-watcher agent installed: ${label} (persistent)"
+  fi
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
 main() {
-  info "Installing mkcert CA (idempotent)..."
-  mkcert -install
+  ensure_step_ca
+  init_step_ca
+  trust_ca_root
 
   local domains=()
   while IFS= read -r d; do
     domains+=("${d}")
-  done < <(collect_domains "$@")
+  done < <(discover_hostnames "$@")
+
+  if (( ${#domains[@]} <= 2 )); then
+    warn "No Traefik-labelled containers found — cert will cover localhost only"
+    warn "Start your docker compose stacks, then re-run this script"
+  fi
 
   local threshold_secs=$(( RENEW_THRESHOLD_DAYS * 86400 ))
   local reason=""
@@ -245,17 +385,17 @@ main() {
   elif cert_needs_renewal "${CERT_FILE}" "${threshold_secs}"; then
     reason="expires within ${RENEW_THRESHOLD_DAYS}d"
   elif cert_sans_changed "${CERT_FILE}" "${domains[@]}"; then
-    reason="SANs changed (Docker network drift)"
+    reason="SANs changed (new Traefik host detected)"
   fi
 
   if [[ -n "${reason}" ]]; then
-    info "Generating cert (${reason}) — ${#domains[@]} domains..."
+    info "Generating cert (${reason}) — ${#domains[@]} SANs..."
     generate_cert "${domains[@]}"
     write_traefik_config
 
     local expiry
     expiry="$(openssl x509 -in "${CERT_FILE}" -noout -enddate | cut -d= -f2)"
-    ok "Cert generated. Expires: ${expiry}"
+    ok "Cert issued. Expires: ${expiry}"
     ok "SANs: $(cert_dns_sans "${CERT_FILE}" | tr '\n' ' ')"
     info "Traefik picks up cert via file-watch — no restart needed"
   else
@@ -264,10 +404,14 @@ main() {
     ok "Cert valid, SANs current. Expires: ${expiry}"
   fi
 
-  # Ensure Traefik config exists even when cert wasn't regenerated
   [[ -f "${DYNAMIC_TLS}" ]] || write_traefik_config
+  install_agents
 
-  install_agent
+  # Restore docker ps wrapper for interactive callers
+  if [[ -n "${_DOCKERPS_SRC}" ]] && [[ -f "${_DOCKERPS_SRC}" ]]; then
+    # shellcheck source=/dev/null
+    source "${_DOCKERPS_SRC}"
+  fi
 
   ok "Done."
 }

@@ -1,0 +1,89 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/compose-spec/compose-spec/main/schema/compose-spec.json
+#
+# Localhost / laptop dev overlay.
+# step-ca acts as a local CA; setup-local-tls discovers Traefik hostnames from
+# Docker labels and issues an explicit-SAN cert. Trust the root CA once with:
+#   sudo scripts/setup-local-tls
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.localhost.yml up -d
+
+services:
+  traefik:
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dashboard.rule=Host(`traefik.localhost`) && (PathPrefix(`/api`) || PathPrefix(`/dashboard`))
+      - traefik.http.routers.dashboard.entrypoints=websecure
+      - traefik.http.routers.dashboard.tls=true
+      - traefik.http.routers.dashboard.service=api@internal
+
+  step-ca:
+    image: smallstep/step-ca:latest
+    restart: unless-stopped
+    mem_limit: 64m
+    mem_reservation: 16m
+    volumes:
+      - step_ca_data:/home/step
+    networks:
+      - traefik-public
+    ports:
+      - "127.0.0.1:9000:9000"
+    environment:
+      # No DOCKER_STEPCA_INIT_* vars — those trigger the entrypoint's built-in
+      # init (always 10-year root). We do our own init in command: below.
+      CA_CERT_DURATION: "${CA_CERT_DURATION:-7920h}"
+      STEP_CA_PASSWORD: "${STEP_CA_PASSWORD:-}"
+    # Custom init: uses 'step certificate create' to set an explicit root CA
+    # duration (step ca init has no --root-not-after flag), then initialises
+    # step-ca with that pre-generated root. Password is written to
+    # /home/step/secrets/password and reused for both root key encryption and
+    # intermediate key encryption so they always stay in sync.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        PASS_FILE=/home/step/secrets/password
+        CA_JSON=/home/step/config/ca.json
+        TMP=/tmp/pki-init
+        CA_NAME="Traefik Local Dev CA"
+
+        if [ ! -f "$$CA_JSON" ]; then
+          echo "Initialising step-ca PKI (root duration: $${CA_CERT_DURATION})..." >&2
+          mkdir -p /home/step/secrets /home/step/config "$$TMP"
+
+          if [ -n "$${STEP_CA_PASSWORD}" ]; then
+            printf '%s' "$${STEP_CA_PASSWORD}" > "$$PASS_FILE"
+          else
+            tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 > "$$PASS_FILE"
+          fi
+
+          step certificate create \
+            "$$CA_NAME Root CA" \
+            "$$TMP/root.crt" "$$TMP/root.key" \
+            --profile root-ca \
+            --not-after "$${CA_CERT_DURATION}" \
+            --password-file "$$PASS_FILE" \
+            --kty RSA --size 2048
+
+          step ca init \
+            --name "$$CA_NAME" \
+            --dns "localhost,step-ca,127.0.0.1" \
+            --address ":9000" \
+            --provisioner "admin@localhost" \
+            --password-file "$$PASS_FILE" \
+            --root "$$TMP/root.crt" \
+            --key "$$TMP/root.key" \
+            --key-password-file "$$PASS_FILE" \
+            --deployment-type standalone
+
+          # Persist root key so setup-local-tls can sign leaf certs directly
+          cp "$$TMP/root.key" /home/step/secrets/root_ca_key
+          rm -rf "$$TMP"
+          echo "step-ca PKI ready" >&2
+        fi
+
+        exec step-ca "$$CA_JSON" --password-file "$$PASS_FILE"
+
+volumes:
+  step_ca_data:
