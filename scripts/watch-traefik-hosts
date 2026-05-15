@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -uo pipefail; IFS=$'\n\t'
+
+# watch-traefik-hosts — watch Docker events and trigger cert regeneration
+# when Traefik-labelled containers start.
+#
+# Runs as a persistent launchd agent (KeepAlive: true, ThrottleInterval: 10s).
+# Exits cleanly if Docker is not running; launchd restarts when it comes back.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+LOCK_FILE="/tmp/com.adamamyl.traefik-local-tls.lock"
+DEBOUNCE_SECS=3
+
+ts()   { date '+%Y-%m-%d %H:%M:%S'; }
+info() { echo "$(ts) [watch-traefik-hosts] $*"; }
+
+# Remove stale lock on startup (e.g. after crash)
+rm -f "${LOCK_FILE}"
+
+if ! docker info >/dev/null 2>&1; then
+  info "Docker not running — exiting (launchd will restart)"
+  exit 0
+fi
+
+trigger_cert_update() {
+  # mkdir is atomic; avoids the test-then-set race of [[ -e ]] + touch
+  if ! mkdir "${LOCK_FILE}" 2>/dev/null; then
+    info "cert update already in progress — skipping"
+    return 0
+  fi
+  (
+    sleep "${DEBOUNCE_SECS}"
+    info "running setup-local-tls..."
+    if "${REPO_ROOT}/scripts/setup-local-tls"; then
+      info "cert update complete"
+    else
+      info "cert update failed (will retry on next event)"
+    fi
+    rm -rf "${LOCK_FILE}"
+  ) &
+}
+
+info "watching Docker for Traefik host changes..."
+
+while IFS= read -r event; do
+  info "container event: ${event}"
+  trigger_cert_update
+done < <(
+  docker events \
+    --filter 'type=container' \
+    --filter 'event=start' \
+    --filter 'label=traefik.enable=true' \
+    2>/dev/null
+)
+
+info "docker events stream ended — exiting (launchd will restart)"
